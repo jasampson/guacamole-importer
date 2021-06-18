@@ -9,7 +9,7 @@ You are free to use these scripts but please do not ask me for support.  I am no
 # Setting things up to run the script
 - You'll need a recent version of Python 3.  This has been used in production on Python 3.7, 3.8 and 3.9 for Linux.
 - You'll need to take a look at settings and add missing passwords for each service account.  The bind_account really only needs read access to Active Directory.
-- You'll need to install the (guacapy)[https://github.com/pschmitt/guacapy] python library and make some changes since this python library doesn't support everything I needed and I was too lazy to submit a pull request.  I've included a .patch file to fix this.
+- You'll need to install the [guacapy](https://github.com/pschmitt/guacapy)s python library and make some changes since this python library doesn't support everything I needed and I was too lazy to submit a pull request.  I've included a .patch file to fix this.
 - You'll need the guacadmin credentials and the guacadmin TOTP secret, which can be found in the Guacamole postgresql database.  If you are even thinking of trying to use script this I will assume you know how to get this on your own.
 - Connectivity to all domain controllers in each domain, to RDP gateways, and to SSH gateways.
 
