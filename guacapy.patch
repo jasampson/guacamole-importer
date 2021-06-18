@@ -1,0 +1,30 @@
+diff --git guacapy/client.py guacapy/client.py
+index 16f77ba..dee063b 100644
+--- guacapy/client.py
++++ guacapy/client.py
+@@ -48,7 +48,7 @@ class Guacamole:
+             raise ValueError("Only http and https methods are valid.")
+         if not url_path:
+             url_path = "/"
+-        self.REST_API = "{}://{}{}/api".format(method, hostname, url_path)
++        self.REST_API = "{}://{}{}api".format(method, hostname, url_path)
+         self.username = username
+         self.password = password
+         self.secret = secret
+@@ -119,6 +119,16 @@ class Guacamole:
+         else:
+             return r
+
++    def get_all_connections(self, datasource=None):
++        if not datasource:
++            datasource = self.primary_datasource
++        return self.__auth_request(
++            method="GET",
++            url="{}/session/data/{}/connections".format(
++                self.REST_API, datasource
++            ),
++        )
++
+     def get_connections(self, datasource=None):
+         if not datasource:
+             datasource = self.primary_datasource
