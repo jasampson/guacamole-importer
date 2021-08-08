@@ -3,8 +3,11 @@
 from dns import resolver
 from ipaddress import ip_address
 from ldap3 import Server, Connection, Tls, SUBTREE
+from time import sleep
+import json
 import ssl
 import guacapy
+import requests
 
 
 def main():
@@ -12,76 +15,11 @@ def main():
     do all of the things
     """
 
-    settings = {
-        "auth": {
-            # guacamole server credentials
-            "server": "guacamole.server.com",
-            "username": "guacadmin",
-            "password": "",
-            "totp": "",
-        },
-        "domains": [
-            # a list of domains dicts to import
-            {
-                "short_domain": "CORP",
-                "dns_domain": "corp.server.com",
-                "bind_dn": "cn=guac-import,ou=Users,dc=corp,dc=server,dc=com",
-                "bind_pw": "changeme123!",
-                "base_dn": "DC=corp,DC=server,DC=com",
-                "server_search_filter": "(|(operatingSystem=Ubuntu*)(operatingSystem=Windows Server*))",
-                "guac_parent_name": "CORP",
-                "guac_parent_identifier": "5",
-                "recursive_read_access": [],
-                "rdp_gateway": [{"pattern": ".corp.server.com", "gateway": ""}],
-                "ssh_gateway": [{"pattern": ".corp.server.com", "gateway": ""}],
-                "transforms": {
-                    "delete": [
-                        "oldserver.corp.server.com"
-                    ],
-                    "add": [
-                        {
-                            "hostname": "server1.corp.server.com",
-                            "operatingsystem": "Ubuntu",
-                        },
-                        {
-                            "hostname": "server2.corp.server.com",
-                            "operatingsystem": "Windows",
-                        },
-                    ],
-                },
-            },
-            {
-                "short_domain": "AWS",
-                "dns_domain": "aws.server.com",
-                "bind_dn": "cn=guac-import,ou=Users,dc=aws,dc=server,dc=com",
-                "bind_pw": "changeme123!",
-                "base_dn": "DC=AWS,DC=server,DC=com",
-                "server_search_filter": "(|(operatingSystem=Ubuntu*)(operatingSystem=Windows Server*))",
-                "guac_parent_name": "AWS",
-                "guac_parent_identifier": "6",
-                "recursive_read_access": [
-                    "Server-Admins-Group"
-                ],
-                "rdp_gateway": [
-                    {"pattern": "use", "gateway": "gateway-use1.aws.server.com"},
-                    {"pattern": "euc", "gateway": "gateway-euc1.aws.server.com"},
-                ],
-                "ssh_gateway": [
-                    {"pattern": "use", "gateway": "sshbastion-use1.aws.server.com"},
-                    {"pattern": "euc", "gateway": "sshbastion-euc1.aws.server.com"},
-                ],
-                "transforms": {"delete": [], "add": []},
-            },
-        ],
-    }
+    # load settings from config
+    settings = guac_load_config("/opt/guacamole/scripts/guac_import.json")
 
     # connect to the guacamole REST API
-    g = guacapy.Guacamole(
-        hostname=settings["auth"]["server"],
-        username=settings["auth"]["username"],
-        password=settings["auth"]["password"],
-        secret=settings["auth"]["totp"],
-    )
+    g = guac_connect(settings)
 
     # iterate through each domain and import them one at a time into guacamole
     for domain_settings in settings["domains"]:
@@ -109,8 +47,10 @@ def main():
         guac_ad_import(g, domain_settings, ad_servers)
 
         # add recursive group permissions to folders if needed
-        if domain_settings['recursive_read_access']:
-            print(f"[{domain_settings['short_domain']}] Setting recursive permissions to connection groups.")
+        if domain_settings["recursive_read_access"]:
+            print(
+                f"[{domain_settings['short_domain']}] Setting recursive permissions to connection groups."
+            )
             guac_user_group_recursive_add(g, domain_settings)
 
         print(f"[{domain_settings['short_domain']}] Completed import.")
@@ -118,8 +58,42 @@ def main():
     print("Exiting normally.")
 
 
+def guac_load_config(config_file: str) -> dict:
+    """
+    loads a json config file and returns it in python dict format
+    """
+    try:
+        with open(config_file) as json_file:
+            settings = json.load(json_file)
+    except FileNotFoundError:
+        raise RuntimeError("guac_import.json: file not found in current directory.")
+    except PermissionError:
+        raise RuntimeError("guac_import.json: cannot read file due to permissions.")
+    except json.JSONDecodeError:
+        raise RuntimeError("guac_import.json: malformed JSON detected.")
+    return settings
+
+
+def guac_connect(settings: dict) -> guacapy.client.Guacamole:
+    while True:
+        try:
+            g = guacapy.Guacamole(
+                hostname=settings["auth"]["server"],
+                username=settings["auth"]["username"],
+                password=settings["auth"]["password"],
+                secret=settings["auth"]["totp"],
+            )
+            break
+        except requests.exceptions.HTTPError:
+            print(
+                "[Warning] HTTP 400 Client Error received.  Retrying REST API connection in 10 seconds."
+            )
+            sleep(10)
+    return g
+
+
 def guac_ad_import(
-    g: guacapy.Guacamole, domain_settings: dict, ad_servers: list
+    g: guacapy.client.Guacamole, domain_settings: dict, ad_servers: list
 ) -> None:
     """
     adds/updates servers in guacamole
@@ -155,6 +129,7 @@ def guac_ad_import(
         for i in g_conns
         if g_conns[i]["name"].split()[0] in ad_servers_to_del
     ]
+    [print(f"[{domain_settings['short_domain']}] Deleting Server: {server}") for server in ad_servers_to_del]
     [
         g.delete_connection(connection_id, "postgresql")
         for connection_id in ad_servers_to_del_ids
@@ -175,9 +150,6 @@ def guac_ad_import(
     ]
 
     for hostname in windows_servers:
-        print(
-            f"[{domain_settings['short_domain']}] Importing Windows Server: {hostname}"
-        )
         # Servers > 2012 R2 need to have glyph caching disabled or connections will break
         if (
             "2008"
@@ -190,12 +162,31 @@ def guac_ad_import(
             )
         else:
             guac_connection_profile = guac_session_rdp(hostname, domain_settings)
-        g.add_connection(guac_connection_profile, "postgresql")
+
+        # only add session profile if the server has a DNS entry
+        if guac_connection_profile:
+            print(
+                f"[{domain_settings['short_domain']}] Importing Windows Server: {hostname}"
+            )
+            g.add_connection(guac_connection_profile, "postgresql")
+        else:
+            print(
+                f"[Warning] Skipped adding {hostname} because it does not have a DNS entry."
+            )
 
     for hostname in linux_servers:
-        print(f"[{domain_settings['short_domain']}] Importing Linux Server: {hostname}")
         guac_connection_profile = guac_session_ssh(hostname, domain_settings)
-        g.add_connection(guac_connection_profile, "postgresql")
+
+        # only add session profile if the server has a DNS entry
+        if guac_connection_profile:
+            print(
+                f"[{domain_settings['short_domain']}] Importing Linux Server: {hostname}"
+            )
+            g.add_connection(guac_connection_profile, "postgresql")
+        else:
+            print(
+                f"[Warning] Skipped adding {hostname} because it does not have a DNS entry."
+            )
 
 
 def guac_session_rdp(
@@ -204,123 +195,137 @@ def guac_session_rdp(
     """
     returns a guacamole session dictionary for an RDP connection
     """
-    # check if hostname is actually an IP address so that we don't .split() it
-    if not is_ip(hostname):
-        short_hostname = hostname.split(".")[0]
-        # add IP address
-        ip = dns_lookup(hostname)
-        if ip:
-            name = f"{short_hostname} ({ip})"
-        else:
-            name = short_hostname
+    session_name = guac_session_get_name(hostname)
+
+    if session_name:
+        # baseline RDP session config is here
+        rdp_session = {
+            "name": session_name,
+            "parentIdentifier": domain_settings["guac_parent_identifier"],
+            "protocol": "rdp",
+            "attributes": {"max-connections": "", "max-connections-per-user": "2"},
+            "activeConnections": 0,
+            "parameters": {
+                "port": "3389",
+                "hostname": hostname,
+                "ignore-cert": "true",
+                "enable-drive": "true",
+                "security": "nla",
+                "username": "${GUAC_USERNAME}",
+                "password": "${GUAC_PASSWORD}",
+                "domain": domain_settings["short_domain"],
+                "drive-path": "/var/tmp/guac_drive/${GUAC_USERNAME}",
+                "create-drive-path": "true",
+                "enable-font-smoothing": "true",
+                "enable-full-window-drag": "true",
+                "enable-wallpaper": "true",
+                "enable-theming": "true",
+                "color-depth": "32",
+            },
+        }
+
+        # if an RDP gateway was specified and the pattern matches our hostname add additional gateway parameters
+        rdp_gateway = [
+            i
+            for i in domain_settings["rdp_gateway"]
+            if i["pattern"] in hostname and i["gateway"]
+        ]
+        if rdp_gateway:
+            rdp_session["parameters"]["gateway-hostname"] = rdp_gateway[0]["gateway"]
+            rdp_session["parameters"]["gateway-username"] = "${GUAC_USERNAME}"
+            rdp_session["parameters"]["gateway-password"] = "${GUAC_PASSWORD}"
+            rdp_session["parameters"]["gateway-domain"] = domain_settings[
+                "short_domain"
+            ]
+            rdp_session["parameters"]["gateway-port"] = "443"
+
+        # For Server 2008 and lower, we need to disable glyph caching because it causes the RDP connection to drop constantly
+        if disable_glyph_caching:
+            rdp_session["parameters"]["disable-glyph-caching"] = "true"
+
+        return rdp_session
     else:
-        name = hostname
-
-    # baseline RDP session config is here
-    rdp_session = {
-        "name": name,
-        "parentIdentifier": domain_settings["guac_parent_identifier"],
-        "protocol": "rdp",
-        "attributes": {"max-connections": "", "max-connections-per-user": "2"},
-        "activeConnections": 0,
-        "parameters": {
-            "port": "3389",
-            "hostname": hostname,
-            "ignore-cert": "true",
-            "enable-drive": "true",
-            "security": "nla",
-            "username": "${GUAC_USERNAME}",
-            "password": "${GUAC_PASSWORD}",
-            "domain": domain_settings["short_domain"],
-            "drive-path": "/var/tmp/guac_drive/${GUAC_USERNAME}",
-            "create-drive-path": "true",
-            "enable-font-smoothing": "true",
-            "enable-full-window-drag": "true",
-            "enable-wallpaper": "true",
-            "enable-theming": "true",
-            "color-depth": "32",
-        },
-    }
-
-    # if an RDP gateway was specified and the pattern matches our hostname add additional gateway parameters
-    rdp_gateway = [
-        i
-        for i in domain_settings["rdp_gateway"]
-        if i["pattern"] in hostname and i["gateway"]
-    ]
-    if rdp_gateway:
-        rdp_session["parameters"]["gateway-hostname"] = rdp_gateway[0]["gateway"]
-        rdp_session["parameters"]["gateway-username"] = "${GUAC_USERNAME}"
-        rdp_session["parameters"]["gateway-password"] = "${GUAC_PASSWORD}"
-        rdp_session["parameters"]["gateway-domain"] = domain_settings["short_domain"]
-        rdp_session["parameters"]["gateway-port"] = "443"
-
-    # For Server 2008 and lower, we need to disable glyph caching because it causes the RDP connection to drop constantly
-    if disable_glyph_caching:
-        rdp_session["parameters"]["disable-glyph-caching"] = "true"
-
-    return rdp_session
+        return False
 
 
 def guac_session_ssh(hostname: str, domain_settings: dict) -> dict:
     """
     returns a guacamole session dictionary for an SSH connection
     """
+    session_name = guac_session_get_name(hostname)
+
+    if session_name:
+        # baseline SSH session config is here
+        ssh_session = {
+            "name": session_name,
+            "identifier": "",
+            "parentIdentifier": domain_settings["guac_parent_identifier"],
+            "protocol": "ssh",
+            "activeConnections": 0,
+            "attributes": {"max-connections": "", "max-connections-per-user": ""},
+            "parameters": {
+                "hostname": hostname,
+                "port": "22",
+                "username": "${GUAC_USERNAME}",
+                "password": "${GUAC_PASSWORD}",
+                "color-scheme": "background: rgb:00/00/00;\n"
+                "foreground: rgb:FF/FF/FF;\n"
+                "color0: rgb:2E/34/36;\n"
+                "color1: rgb:CC/00/00;\n"
+                "color2: rgb:4E/9A/06;\n"
+                "color3: rgb:C4/A0/00;\n"
+                "color4: rgb:34/65/A4;\n"
+                "color5: rgb:75/50/7B;\n"
+                "color6: rgb:06/98/9A;\n"
+                "color7: rgb:D3/D7/CF;\n"
+                "color8: rgb:55/57/53;\n"
+                "color9: rgb:EF/29/29;\n"
+                "color10: rgb:8A/E2/34;\n"
+                "color11: rgb:FC/E9/4F;\n"
+                "color12: rgb:72/9F/CF;\n"
+                "color13: rgb:AD/7F/A8;\n"
+                "color14: rgb:34/E2/E2;\n"
+                "color15: rgb:EE/EE/EC;",
+            },
+        }
+
+        # if an SSH gateway was specified add additional gateway parameters
+        ssh_gateway = [
+            i
+            for i in domain_settings["ssh_gateway"]
+            if i["pattern"] in hostname and i["gateway"]
+        ]
+        if ssh_gateway:
+            ssh_session["parameters"]["hostname"] = ssh_gateway[0]["gateway"]
+            ssh_session["parameters"]["command"] = f"ssh -q {hostname}"
+        return ssh_session
+    else:
+        return False
+
+
+def guac_session_get_name(hostname: str) -> str:
+    """
+    turns an ip/hostname string into a formatted session name
+    """
     # check if hostname is actually an IP address so that we don't .split() it
     if not is_ip(hostname):
         short_hostname = hostname.split(".")[0]
-        # add IP address
+        # look up IP using DNS
         ip = dns_lookup(hostname)
         if ip:
-            name = f"{short_hostname} ({ip})"
+            # behave slightly differently if dns_lookup returns multiple results
+            if len(ip) > 1:
+                name = f"{short_hostname} ({' '.join(ip)})"
+            elif len(ip) == 1:
+                name = f"{short_hostname} ({ip[0]})"
+            else:
+                name = short_hostname
         else:
-            name = short_hostname
+            # return False so we can skip this server
+            return False
     else:
         name = hostname
-
-    ssh_session = {
-        "name": name,
-        "identifier": "",
-        "parentIdentifier": domain_settings["guac_parent_identifier"],
-        "protocol": "ssh",
-        "activeConnections": 0,
-        "attributes": {"max-connections": "", "max-connections-per-user": ""},
-        "parameters": {
-            "hostname": hostname,
-            "port": "22",
-            "username": "${GUAC_USERNAME}",
-            "password": "${GUAC_PASSWORD}",
-            "color-scheme": "background: rgb:00/00/00;\n"
-            "foreground: rgb:FF/FF/FF;\n"
-            "color0: rgb:2E/34/36;\n"
-            "color1: rgb:CC/00/00;\n"
-            "color2: rgb:4E/9A/06;\n"
-            "color3: rgb:C4/A0/00;\n"
-            "color4: rgb:34/65/A4;\n"
-            "color5: rgb:75/50/7B;\n"
-            "color6: rgb:06/98/9A;\n"
-            "color7: rgb:D3/D7/CF;\n"
-            "color8: rgb:55/57/53;\n"
-            "color9: rgb:EF/29/29;\n"
-            "color10: rgb:8A/E2/34;\n"
-            "color11: rgb:FC/E9/4F;\n"
-            "color12: rgb:72/9F/CF;\n"
-            "color13: rgb:AD/7F/A8;\n"
-            "color14: rgb:34/E2/E2;\n"
-            "color15: rgb:EE/EE/EC;",
-        },
-    }
-
-    # if an SSH gateway was specified add additional gateway parameters
-    ssh_gateway = [
-        i
-        for i in domain_settings["ssh_gateway"]
-        if i["pattern"] in hostname and i["gateway"]
-    ]
-    if ssh_gateway:
-        ssh_session["parameters"]["hostname"] = ssh_gateway[0]["gateway"]
-        ssh_session["parameters"]["command"] = f"ssh -q {hostname}"
-    return ssh_session
+    return name
 
 
 def apply_transforms(domain_settings: dict, servers: list) -> list:
@@ -374,7 +379,7 @@ def ldap_get_servers(domain: dict) -> list:
     return out
 
 
-def is_ip(host):
+def is_ip(host: str) -> bool:
     """
     returns True if host is a valid ipv4 address
     """
@@ -385,19 +390,27 @@ def is_ip(host):
     return True
 
 
-def dns_lookup(hostname: str) -> str:
+def dns_lookup(hostname: str) -> list:
     """
     returns a result, or False if no result
     """
     try:
         dns_answer = resolver.resolve(hostname, "A")
-        dns_answer = dns_answer.response.answer[0].to_text().split()[-1]
+        dns_answer = [
+            answer.split()[-1]
+            for answer in dns_answer.response.answer[0].to_text().split("\n")
+        ]
+        # sort ips if more than 1 result is received
+        if len(dns_answer) > 1:
+            dns_answer = [str(ip) for ip in sorted([ip_address(i) for i in dns_answer])]
     except resolver.NXDOMAIN:
         return False
     return dns_answer
 
 
-def guac_user_group_recursive_add(g: guacapy.Guacamole, domain_settings: dict) -> None:
+def guac_user_group_recursive_add(
+    g: guacapy.client.Guacamole, domain_settings: dict
+) -> None:
     """
     adds user groups to folders in guacamole recursively
     """
@@ -408,11 +421,17 @@ def guac_user_group_recursive_add(g: guacapy.Guacamole, domain_settings: dict) -
     guac_user_groups_list = [*guac_user_groups]
 
     # do very some basic error checking.  the group we're giving permissions to must be in the guac DB or this won't work
-    if [group for group in domain_settings['recursive_read_access'] if group not in guac_user_groups_list]:
-        raise RuntimeError(f"There are AD groups present in settings['{domain_settings['short_domain']}']['recursive_read_access'] "
-                           "that do not exist in guacamole db")
+    if [
+        group
+        for group in domain_settings["recursive_read_access"]
+        if group not in guac_user_groups_list
+    ]:
+        raise RuntimeError(
+            f"There are AD groups present in settings['{domain_settings['short_domain']}']['recursive_read_access'] "
+            "that do not exist in guacamole db"
+        )
 
-    for ad_group in domain_settings['recursive_read_access']:
+    for ad_group in domain_settings["recursive_read_access"]:
         # this first section deals with adding the group to individual connection profiles.  there is another section below that adds
         # the group to connection groups since that requires a slightly different API payload.
 
@@ -420,25 +439,45 @@ def guac_user_group_recursive_add(g: guacapy.Guacamole, domain_settings: dict) -
         guac_group_permissions = g.get_group_permissions(ad_group)
 
         # first filter guac_conns to only show things that are under our connection folder parentIdentifier
-        guac_conns_ids_in_folder = [guac_conns[i]['identifier'] for i in guac_conns if guac_conns[i]['parentIdentifier'] == domain_settings['guac_parent_identifier']]
+        guac_conns_ids_in_folder = [
+            guac_conns[i]["identifier"]
+            for i in guac_conns
+            if guac_conns[i]["parentIdentifier"]
+            == domain_settings["guac_parent_identifier"]
+        ]
         # next, gather permissions entries for ad_group
-        guac_conns_permissions = guac_group_permissions['connectionPermissions']
+        guac_conns_permissions = guac_group_permissions["connectionPermissions"]
         # third, take the above 2 items and make a list where they intersect.  this tells us which connection profiles in the connection folder the ad_group has read access to
-        guac_conns_ids_read_access = [i for i in guac_conns_permissions if guac_conns_permissions[i] == ['READ'] and i in guac_conns_ids_in_folder]
+        guac_conns_ids_read_access = [
+            i
+            for i in guac_conns_permissions
+            if guac_conns_permissions[i] == ["READ"] and i in guac_conns_ids_in_folder
+        ]
         # last, create a list containing only ids which do not already have read access
-        guac_conns_ids_to_add = [i for i in guac_conns_ids_in_folder if i not in guac_conns_ids_read_access]
+        guac_conns_ids_to_add = [
+            i for i in guac_conns_ids_in_folder if i not in guac_conns_ids_read_access
+        ]
 
         # add read access to any missing profiles
-        [guac_grant_read_permissions_to_connection_profile(g, connection_id, ad_group) for connection_id in guac_conns_ids_to_add]
+        [
+            guac_grant_read_permissions_to_connection_profile(
+                g, connection_id, ad_group
+            )
+            for connection_id in guac_conns_ids_to_add
+        ]
 
         # add permissions for the connection group if they haven't been granted
         try:
-            guac_group_permissions[domain_settings['guac_parent_identifier']]
+            guac_group_permissions[domain_settings["guac_parent_identifier"]]
         except KeyError:
-            guac_grant_read_permission_to_connection_group(g, domain_settings['guac_parent_identifier'], ad_group)
+            guac_grant_read_permission_to_connection_group(
+                g, domain_settings["guac_parent_identifier"], ad_group
+            )
 
 
-def guac_grant_read_permissions_to_connection_profile(g: guacapy.Guacamole, connection_id, ad_group):
+def guac_grant_read_permissions_to_connection_profile(
+    g: guacapy.client.Guacamole, connection_id: str, ad_group: str
+) -> None:
     """
     grants read access to ad_group on connection_id object
     """
@@ -447,13 +486,15 @@ def guac_grant_read_permissions_to_connection_profile(g: guacapy.Guacamole, conn
         {
             "op": "add",
             "path": f"/connectionPermissions/{connection_id}",
-            "value": "READ"
+            "value": "READ",
         }
     ]
     g.grant_group_permission(ad_group, payload)
 
 
-def guac_grant_read_permission_to_connection_group(g: guacapy.Guacamole, parent_id, ad_group):
+def guac_grant_read_permission_to_connection_group(
+    g: guacapy.client.Guacamole, parent_id: str, ad_group: str
+) -> None:
     """
     grants read access to ad_group on connection_id object
     """
@@ -462,7 +503,7 @@ def guac_grant_read_permission_to_connection_group(g: guacapy.Guacamole, parent_
         {
             "op": "add",
             "path": f"/connectionGroupPermissions/{parent_id}",
-            "value": "READ"
+            "value": "READ",
         }
     ]
     g.grant_group_permission(ad_group, payload)
