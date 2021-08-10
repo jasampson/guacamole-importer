@@ -1,0 +1,90 @@
+{
+  "auth": {
+    "server": "guacamole.corp.domain.com",
+    "username": "guacadmin",
+    "password": "changeme",
+    "totp": "AREALLYLONGSTRINGTHATCANBEFOUNDINTHEGUACAMOLEDB"
+  },
+  "domains": [
+    {
+      "short_domain": "CORP",
+      "dns_domain": "corp.arena.net",
+      "bind_dn": "cn=ldap_user,ou=Users,dc=corp,dc=domain,dc=com",
+      "bind_pw": "changeme",
+      "base_dn": "dc=corp,dc=domain,dc=com",
+      "server_search_filter": "(|(operatingSystem=Ubuntu*)(operatingSystem=Windows Server*))",
+      "guac_parent_name": "CORP",
+      "guac_parent_identifier": "5",
+      "recursive_read_access": [],
+      "rdp_gateway": [
+        {
+          "pattern": ".corp.domain.com",
+          "gateway": ""
+        }
+      ],
+      "ssh_gateway": [
+        {
+          "pattern": ".corp.domain.com",
+          "gateway": ""
+        }
+      ],
+      "transforms": {
+        "delete": [
+          "server01.corp.domain.com",
+          "server02.corp.domain.com"
+        ],
+        "add": [
+          {
+            "hostname": "server-01.corp.domain.com",
+            "operatingsystem": "Ubuntu"
+          },
+          {
+            "hostname": "server-02.corp.domain.com",
+            "operatingsystem": "Windows"
+          }
+        ]
+      }
+    },
+    {
+      "short_domain": "AWS",
+      "dns_domain": "aws.domain.com",
+      "bind_dn": "CN=ldap_user,OU=Users,DC=AWS,DC=domain,DC=com",
+      "bind_pw": "changeme",
+      "base_dn": "DC=AWS,DC=domain,DC=com",
+      "server_search_filter": "(|(operatingSystem=Ubuntu*)(operatingSystem=Windows Server*))",
+      "guac_parent_name": "AWS",
+      "guac_parent_identifier": "6",
+      "recursive_read_access": [
+        "Example-Security-Group"
+      ],
+      "rdp_gateway": [
+        {
+          "pattern": "use",
+          "gateway": "gateway-use1.aws.domain.com"
+        },
+        {
+          "pattern": "euc",
+          "gateway": "gateway-euc1.aws.domain.com"
+        },
+        {
+          "pattern": "ecu",
+          "gateway": "gateway-euc1.aws.domain.com"
+        }
+      ],
+      "ssh_gateway": [
+        {
+          "pattern": "use",
+          "gateway": "gateway-ssh-use1.aws.domain.com"
+        },
+        {
+          "pattern": "euc",
+          "gateway": "gateway-ssh-euc1.aws.domain.com"
+        }
+      ],
+      "transforms": {
+        "delete": [],
+        "add": []
+      }
+    }
+  ]
+}
