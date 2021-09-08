@@ -25,7 +25,7 @@ def main():
     for domain_settings in settings["domains"]:
         print(f"[{domain_settings['short_domain']}] Starting import.")
         print(
-            f"[{domain_settings['short_domain']}] Retrieving server info from domain controllers."
+            f"[{domain_settings['short_domain']}] Querying Active Directory for server accounts."
         )
         ldap_out = ldap_get_servers(domain_settings)
 
@@ -44,7 +44,7 @@ def main():
         ad_servers = apply_transforms(domain_settings, ad_servers)
 
         # import sessions from Active Directory
-        guac_ad_import(g, domain_settings, ad_servers)
+        guac_sync_sessions(g, domain_settings, ad_servers)
 
         # add recursive group permissions to folders if needed
         if domain_settings["recursive_read_access"]:
@@ -73,7 +73,6 @@ def guac_load_config(config_file: str) -> dict:
         raise RuntimeError("guac_import.json: malformed JSON detected.")
     return settings
 
-
 def guac_connect(settings: dict) -> guacapy.client.Guacamole:
     while True:
         try:
@@ -92,38 +91,68 @@ def guac_connect(settings: dict) -> guacapy.client.Guacamole:
     return g
 
 
-def guac_ad_import(
+def guac_sync_sessions(
     g: guacapy.client.Guacamole, domain_settings: dict, ad_servers: list
 ) -> None:
     """
-    adds/updates servers in guacamole
+    adds/updates/deletes servers in guacamole using Active Directory and DNS
     """
     # for guacamole api stuff this unofficial documentation is very useful
     # https://github.com/ridvanaltun/guacamole-rest-api-documentation
 
     # connect to guac api and retrieve a list of servers from postgresql
+    print(f"[{domain_settings['short_domain']}] Querying Guacamole PostgreSQL database for existing guacamole sessions.")
     g_conns = g.get_all_connections("postgresql")
 
     # if for some reason you need to nuke everything from guacamole, this could be used:
     # [g.delete_connection(j, 'postgresql') for j in [i for i in g_conns]]
 
-    # clean up server names from the guacamole db and from AD and compare them
-    g_servers = [
-        g_conns[i]["name"].split()[0]
+    # query guacamole db for session names and derive server short names from this
+    g_session_names = [
+        g_conns[i]["name"]
         for i in g_conns
         if g_conns[i]["parentIdentifier"] == domain_settings["guac_parent_identifier"]
     ]
+    g_servers_short = [
+        i.split()[0]
+        for i in g_session_names
+    ]
+    # shorten server names from AD
     ad_servers_short = [i["hostname"].split(".")[0] for i in ad_servers]
+    # query DNS for what session names should look like and store it for later use
+    print(f"[{domain_settings['short_domain']}] Querying DNS for server DNS entries.")
+    dns_session_names = {}
+    for hostname in g_servers_short:
+        dns_session_names[hostname] = guac_session_get_name(f"{hostname}.{domain_settings['dns_domain']}")
 
-    # create lists of servers to add or delete
+    # create lists of servers to add, delete or update
+    print(f"[{domain_settings['short_domain']}] Computing guacamole sessions to add/remove/update.")
     ad_servers_to_add = [
-        server for server in ad_servers_short if server not in g_servers
+        server for server in ad_servers_short if server not in g_servers_short
     ]
     ad_servers_to_del = [
-        server for server in g_servers if server not in ad_servers_short
+        server for server in g_servers_short if server not in ad_servers_short
+    ]
+    servers_to_update = [
+        server for server in g_servers_short if dns_session_names[server] and dns_session_names[server] not in g_session_names
     ]
 
-    # delete servers first
+    # update servers
+    servers_to_update_ids = [
+        g_conns[i]["identifier"]
+        for i in g_conns
+        if g_conns[i]["name"].split()[0] in servers_to_update
+    ]
+    for conn_id in servers_to_update_ids:
+        conn_profile = g.get_connection_full(conn_id)
+        new_name = dns_session_names[conn_profile['parameters']['hostname'].split('.')[0]]
+        if len(new_name) == 128:
+            print(f"[{domain_settings['short_domain']}] Warning: Server: {conn_profile['parameters']['hostname']} session name has been truncated due to length >= 128.  This can happen when a server has many IPs in DNS.")
+        print(f"[{domain_settings['short_domain']}] Updating Server: {conn_profile['parameters']['hostname']} From: {conn_profile['name']} To: {new_name}")
+        conn_profile['name'] = new_name
+        g.edit_connection(conn_id, conn_profile, "postgresql")
+
+    # delete servers
     ad_servers_to_del_ids = [
         g_conns[i]["identifier"]
         for i in g_conns
@@ -135,7 +164,7 @@ def guac_ad_import(
         for connection_id in ad_servers_to_del_ids
     ]
 
-    # add guac guac_sessions
+    # add servers
     windows_servers = [
         s["hostname"]
         for s in ad_servers
@@ -325,7 +354,7 @@ def guac_session_get_name(hostname: str) -> str:
             return False
     else:
         name = hostname
-    return name
+    return name[0:128]
 
 
 def apply_transforms(domain_settings: dict, servers: list) -> list:
@@ -354,7 +383,7 @@ def ldap_get_servers(domain: dict) -> list:
     dc = dns_answer[0].to_text().split()[-1][:-1]
 
     # set up ssl/tls ldap connection to domain controller
-    tls = Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1)
+    tls = Tls(validate=ssl.CERT_NONE)
     ldap_server = Server(dc, use_ssl=True, tls=tls)
     ldap_conn = Connection(
         ldap_server, domain["bind_dn"], domain["bind_pw"], auto_bind=True

@@ -24,9 +24,9 @@ def main():
 
     # connect to guacamole REST API
     g = guacapy.Guacamole(
-        hostname=settings['auth']['server'],
-        username=settings['auth']['username'],
-        password=settings['auth']['password'],
+        hostname=settings["auth"]["server"],
+        username=settings["auth"]["username"],
+        password=settings["auth"]["password"],
     )
     g_conns = g.get_all_connections("postgresql")
     # delete all connections from postgresql database

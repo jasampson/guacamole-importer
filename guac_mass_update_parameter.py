@@ -24,14 +24,16 @@ def main():
 
     # connect to guacamole API
     g = guacapy.Guacamole(
-        hostname=settings['auth']['server'],
-        username=settings['auth']['username'],
-        password=settings['auth']['password'],
+        hostname=settings["auth"]["server"],
+        username=settings["auth"]["username"],
+        password=settings["auth"]["password"],
     )
     g_conns = g.get_all_connections("postgresql")
 
     # here i'm filtering the connection profiles based on protocol type.  this could be removed if you want to update everything
-    conn_ids = [g_conns[i]['identifier'] for i in g_conns if g_conns[i]["protocol"] == "rdp"]
+    conn_ids = [
+        g_conns[i]["identifier"] for i in g_conns if g_conns[i]["protocol"] == "rdp"
+    ]
 
     # loop through every connection profile and update the attribute
     for conn_id in conn_ids:
