@@ -73,6 +73,7 @@ def guac_load_config(config_file: str) -> dict:
         raise RuntimeError("guac_import.json: malformed JSON detected.")
     return settings
 
+
 def guac_connect(settings: dict) -> guacapy.client.Guacamole:
     while True:
         try:
@@ -101,7 +102,9 @@ def guac_sync_sessions(
     # https://github.com/ridvanaltun/guacamole-rest-api-documentation
 
     # connect to guac api and retrieve a list of servers from postgresql
-    print(f"[{domain_settings['short_domain']}] Querying Guacamole PostgreSQL database for existing guacamole sessions.")
+    print(
+        f"[{domain_settings['short_domain']}] Querying Guacamole PostgreSQL database for existing guacamole sessions."
+    )
     g_conns = g.get_all_connections("postgresql")
 
     # if for some reason you need to nuke everything from guacamole, this could be used:
@@ -113,20 +116,21 @@ def guac_sync_sessions(
         for i in g_conns
         if g_conns[i]["parentIdentifier"] == domain_settings["guac_parent_identifier"]
     ]
-    g_servers_short = [
-        i.split()[0]
-        for i in g_session_names
-    ]
+    g_servers_short = [i.split()[0] for i in g_session_names]
     # shorten server names from AD
     ad_servers_short = [i["hostname"].split(".")[0] for i in ad_servers]
     # query DNS for what session names should look like and store it for later use
     print(f"[{domain_settings['short_domain']}] Querying DNS for server DNS entries.")
     dns_session_names = {}
     for hostname in g_servers_short:
-        dns_session_names[hostname] = guac_session_get_name(f"{hostname}.{domain_settings['dns_domain']}")
+        dns_session_names[hostname] = guac_session_get_name(
+            f"{hostname}.{domain_settings['dns_domain']}"
+        )
 
     # create lists of servers to add, delete or update
-    print(f"[{domain_settings['short_domain']}] Computing guacamole sessions to add/remove/update.")
+    print(
+        f"[{domain_settings['short_domain']}] Computing guacamole sessions to add/remove/update."
+    )
     ad_servers_to_add = [
         server for server in ad_servers_short if server not in g_servers_short
     ]
@@ -134,7 +138,10 @@ def guac_sync_sessions(
         server for server in g_servers_short if server not in ad_servers_short
     ]
     servers_to_update = [
-        server for server in g_servers_short if dns_session_names[server] and dns_session_names[server] not in g_session_names
+        server
+        for server in g_servers_short
+        if dns_session_names[server]
+        and dns_session_names[server] not in g_session_names
     ]
 
     # update servers
@@ -145,11 +152,26 @@ def guac_sync_sessions(
     ]
     for conn_id in servers_to_update_ids:
         conn_profile = g.get_connection_full(conn_id)
-        new_name = dns_session_names[conn_profile['parameters']['hostname'].split('.')[0]]
+        # some sessions use commands to relay ssh through bastion hosts.  in this case, we have to derive the remote hostanme from the command field and not the hostname field
+        if (
+            conn_profile["protocol"] == "ssh"
+            and "ssh" in conn_profile["parameters"]["command"]
+        ):
+            new_name = dns_session_names[
+                conn_profile["parameters"]["command"].split()[2].split(".")[0]
+            ]
+        else:
+            new_name = dns_session_names[
+                conn_profile["parameters"]["hostname"].split(".")[0]
+            ]
         if len(new_name) == 128:
-            print(f"[{domain_settings['short_domain']}] Warning: Server: {conn_profile['parameters']['hostname']} session name has been truncated due to length >= 128.  This can happen when a server has many IPs in DNS.")
-        print(f"[{domain_settings['short_domain']}] Updating Server: {conn_profile['parameters']['hostname']} From: {conn_profile['name']} To: {new_name}")
-        conn_profile['name'] = new_name
+            print(
+                f"[{domain_settings['short_domain']}] Warning: Server: {conn_profile['parameters']['hostname']} session name has been truncated due to length >= 128.  This can happen when a server has many IPs in DNS."
+            )
+        print(
+            f"[{domain_settings['short_domain']}] Updating Server: {conn_profile['parameters']['hostname']} From: {conn_profile['name']} To: {new_name}"
+        )
+        conn_profile["name"] = new_name
         g.edit_connection(conn_id, conn_profile, "postgresql")
 
     # delete servers
@@ -158,7 +180,10 @@ def guac_sync_sessions(
         for i in g_conns
         if g_conns[i]["name"].split()[0] in ad_servers_to_del
     ]
-    [print(f"[{domain_settings['short_domain']}] Deleting Server: {server}") for server in ad_servers_to_del]
+    [
+        print(f"[{domain_settings['short_domain']}] Deleting Server: {server}")
+        for server in ad_servers_to_del
+    ]
     [
         g.delete_connection(connection_id, "postgresql")
         for connection_id in ad_servers_to_del_ids
